@@ -1,0 +1,325 @@
+;;; ==============================
+;;; DimQuick.LSP
+;;;  - 폴리선/선의 외곽 치수를 한 번에 기입
+;;;
+;;; 원본파일: DPL.lsp (Terry Miller)
+;;;
+;;; 명령어: DQ
+;;;
+;;; 사용법
+;;;  1) DQ 입력
+;;;  2) 치수를 넣을 LWPOLYLINE 또는 LINE 선택
+;;;
+;;; 가정 / 주의
+;;;  - LWPOLYLINE, LINE만 지원 (선은 가로/세로 치수만 기입)
+;;;  - 구형 DIM1 명령 사용, 치수 간격은 DIMSCALE x DIMTXT x 3 기준
+;;;
+;;; 동작방식
+;;;  - 꼭짓점을 시계방향으로 정렬해 좌/상/우/하 변별 연속 치수 기입
+;;;  - 치수 레이어는 켜져 있고 치수가 가장 많은 레이어 (없으면 현재 레이어)
+;;; ==============================
+
+;;------------------------------
+;;  보조 함수
+;;------------------------------
+
+;; 시스템 변수 복원 (정상 종료와 *error* 공용)
+(defun dq:restore (cmdecho-orig osmode-orig clayer-orig)
+  (if cmdecho-orig
+    (setvar "CMDECHO" cmdecho-orig)
+  )
+  (if osmode-orig
+    (setvar "OSMODE" osmode-orig)
+  )
+  (if clayer-orig
+    (setvar "CLAYER" clayer-orig)
+  )
+)
+
+;; 켜진 레이어 중 치수가 가장 많은 레이어명, 없으면 현재 레이어명
+(defun dq:get-dim-layer (/ layer ss i layer-name layer-info layer-list count entry best-count)
+  (setq layer (getvar "CLAYER"))
+  (setq ss (ssget "X" '((0 . "DIMENSION"))))
+  (if ss
+    (progn
+      (setq i 0)
+      (while (< i (sslength ss))
+        (setq layer-name (cdr (assoc 8 (entget (ssname ss i)))))
+        (setq layer-info (tblsearch "LAYER" layer-name))
+        (if (and (= (cdr (assoc 70 layer-info)) 0) (> (cdr (assoc 62 layer-info)) 0))
+          (if (assoc layer-name layer-list)
+            (progn
+              (setq count (1+ (cdr (assoc layer-name layer-list))))
+              (setq layer-list (subst (cons layer-name count) (assoc layer-name layer-list) layer-list))
+            )
+            (setq layer-list (append layer-list (list (cons layer-name 1))))
+          )
+        )
+        (setq i (1+ i))
+      )
+      (setq best-count 0)
+      (foreach entry layer-list
+        (if (> (cdr entry) best-count)
+          (progn
+            (setq layer (car entry))
+            (setq best-count (cdr entry))
+          )
+        )
+      )
+    )
+  )
+  layer
+)
+
+;; start-pt ~ end-pt 구간의 꼭짓점 중 같은 축 위의 중간점을 제거해 치수점 목록 반환
+;; side: "Left" "Top" "Right" "Bottom"
+(defun dq:dim-pts (pts start-pt end-pt side / add-p vertical nums1 nums2 num1 num2 pt ret)
+  (setq add-p T)
+  (foreach pt (member start-pt (append pts pts))
+    (if add-p
+      (setq ret (append ret (list pt)))
+    )
+    (if (equal pt end-pt)
+      (setq add-p nil)
+    )
+  )
+  (setq vertical (member side '("Left" "Right")))
+  (foreach pt ret
+    (if vertical
+      (setq nums1 (append nums1 (list (cadr pt))))
+      (setq nums1 (append nums1 (list (car pt))))
+    )
+  )
+  (foreach num1 (vl-sort nums1 '<)
+    (setq nums2 nil)
+    (foreach pt ret
+      (cond
+        ((and vertical (= (cadr pt) num1))
+          (setq nums2 (append nums2 (list (car pt))))
+        )
+        ((and (not vertical) (= (car pt) num1))
+          (setq nums2 (append nums2 (list (cadr pt))))
+        )
+      )
+    )
+    (if (member side '("Left" "Bottom"))
+      (setq nums2 (vl-sort nums2 '<))
+      (setq nums2 (reverse (vl-sort nums2 '<)))
+    )
+    (foreach num2 (cdr nums2)
+      (if vertical
+        (setq pt (list num2 num1))
+        (setq pt (list num1 num2))
+      )
+      (setq ret (vl-remove pt ret))
+    )
+  )
+  (cond
+    ((= side "Left")
+      (vl-sort ret (function (lambda (p1 p2) (< (cadr p1) (cadr p2)))))
+    )
+    ((= side "Top")
+      (vl-sort ret (function (lambda (p1 p2) (< (car p1) (car p2)))))
+    )
+    ((= side "Right")
+      (vl-sort ret (function (lambda (p1 p2) (> (cadr p1) (cadr p2)))))
+    )
+    ((= side "Bottom")
+      (vl-sort ret (function (lambda (p1 p2) (> (car p1) (car p2)))))
+    )
+  )
+)
+
+;; 인접한 점끼리 연속 치수 기입 (mode: "HOR" 또는 "VER")
+(defun dq:dim-chain (mode pts base-pt / p1 p2)
+  (setq p1 (car pts))
+  (foreach p2 (cdr pts)
+    (command "DIM1" mode p1 p2 base-pt "")
+    (setq p1 p2)
+  )
+)
+
+;; 객체 하나의 외곽 치수 기입 (LWPOLYLINE, LINE)
+(defun dq:dimension (ent-name / ent-list ent-type item last-pt last-ang diff-ang pts pts-len
+                     x y x-pts y-pts x1 x2 y1 y2 x1-ys x2-ys y1-xs y2-xs
+                     x1y1 x1y2 x2y1 x2y2 y1x1 y1x2 y2x1 y2x2
+                     se-pts nw-pts cw pt left-pts top-pts right-pts bottom-pts dim-space p0)
+  (setq ent-list (entget ent-name))
+  (setq ent-type (cdr (assoc 0 ent-list)))
+  ;; LINE은 시작점(10)과 끝점(11)을 모두 꼭짓점으로 사용
+  (foreach item ent-list
+    (if (or (= (car item) 10) (and (= (car item) 11) (= ent-type "LINE")))
+      (if (not (equal (cdr item) last-pt))
+        (progn
+          (setq pts (append pts (list (cdr item))))
+          (if (and (> (length pts) 2) (/= (angle last-pt (cdr item)) last-ang))
+            (setq diff-ang T)
+          )
+          (if (> (length pts) 1)
+            (setq last-ang (angle last-pt (cdr item)))
+          )
+          (setq last-pt (cdr item))
+        )
+      )
+    )
+  )
+  ;; 닫힌 폴리선은 중복된 끝점 제거
+  (if (equal (car pts) (last pts))
+    (setq pts (reverse (cdr (reverse pts))))
+  )
+  (setq pts-len (length pts))
+  ;; 부동소수 오차 제거를 위해 소수 8자리로 반올림
+  (foreach pt pts
+    (setq x (atof (rtos (car pt) 2 8)))
+    (setq y (atof (rtos (cadr pt) 2 8)))
+    (setq x-pts (append x-pts (list x)))
+    (setq y-pts (append y-pts (list y)))
+    (setq pts (cdr (append pts (list (list x y)))))
+  )
+  (setq x-pts (vl-sort x-pts '<))
+  (setq y-pts (vl-sort y-pts '<))
+  (setq x1 (car x-pts))
+  (setq x2 (last x-pts))
+  (setq y1 (car y-pts))
+  (setq y2 (last y-pts))
+  (foreach pt pts
+    (if (= (car pt) x1)
+      (setq x1-ys (append x1-ys (list (cadr pt))))
+    )
+    (if (= (car pt) x2)
+      (setq x2-ys (append x2-ys (list (cadr pt))))
+    )
+    (if (= (cadr pt) y1)
+      (setq y1-xs (append y1-xs (list (car pt))))
+    )
+    (if (= (cadr pt) y2)
+      (setq y2-xs (append y2-xs (list (car pt))))
+    )
+  )
+  (setq x1-ys (vl-sort x1-ys '<))
+  (setq x2-ys (vl-sort x2-ys '<))
+  (setq y1-xs (vl-sort y1-xs '<))
+  (setq y2-xs (vl-sort y2-xs '<))
+  (setq x1y1 (list x1 (car x1-ys)))
+  (setq x1y2 (list x1 (last x1-ys)))
+  (setq x2y1 (list x2 (car x2-ys)))
+  (setq x2y2 (list x2 (last x2-ys)))
+  (setq y1x1 (list (car y1-xs) y1))
+  (setq y1x2 (list (last y1-xs) y1))
+  (setq y2x1 (list (car y2-xs) y2))
+  (setq y2x2 (list (last y2-xs) y2))
+  ;; 꼭짓점 순서를 x1y1부터 시작하도록 회전
+  (setq pts (member x1y1 (append pts pts)))
+  (while (> (length pts) pts-len)
+    (setq pts (reverse (cdr (reverse pts))))
+  )
+  ;; 진행 방향(시계/반시계) 판별: 서북쪽 경로와 동남쪽 경로로 나눠 점수 계산
+  (setq se-pts (member x2y2 pts))
+  (setq nw-pts pts)
+  (foreach item se-pts
+    (setq nw-pts (vl-remove item nw-pts))
+  )
+  (setq se-pts (append se-pts (list x1y1)))
+  (setq nw-pts (append nw-pts (list x2y2)))
+  (setq cw 0)
+  (foreach pt (list y2x1 y2x2)
+    (if (member pt nw-pts)
+      (setq cw (1+ cw))
+    )
+    (if (member pt se-pts)
+      (setq cw (1- cw))
+    )
+  )
+  (foreach pt (list y1x1 y1x2)
+    (if (member pt se-pts)
+      (setq cw (1+ cw))
+    )
+    (if (member pt nw-pts)
+      (setq cw (1- cw))
+    )
+  )
+  (if (< cw 0)
+    (setq pts (append (list (car pts)) (reverse (cdr pts))))
+  )
+  (setq left-pts (dq:dim-pts pts y1x1 y2x1 "Left"))
+  (setq top-pts (dq:dim-pts pts x1y2 x2y2 "Top"))
+  (setq right-pts (dq:dim-pts pts y2x2 y1x2 "Right"))
+  (setq bottom-pts (dq:dim-pts pts x2y1 x1y1 "Bottom"))
+  ;; 치수 기입: 왼쪽 -> 위 -> 오른쪽 -> 아래
+  (setq dim-space (* (getvar "DIMSCALE") (getvar "DIMTXT") 3))
+  (setq p0 (polar x1y1 pi (* dim-space 1.5)))
+  (dq:dim-chain "VER" left-pts p0)
+  (if (> (length left-pts) 2)
+    (progn
+      (setq p0 (polar p0 pi dim-space))
+      (dq:dim-chain "VER" (list (car left-pts) (last left-pts)) p0)
+    )
+  )
+  (setq p0 (polar y2x1 (* pi 0.5) (* dim-space 1.5)))
+  (dq:dim-chain "HOR" top-pts p0)
+  (if (> (length top-pts) 2)
+    (progn
+      (setq p0 (polar p0 (* pi 0.5) dim-space))
+      (dq:dim-chain "HOR" (list (car top-pts) (last top-pts)) p0)
+    )
+  )
+  ;; 오른쪽/아래는 변 방향이 바뀌는 도형에서만 기입
+  (if (and (> (length right-pts) 2) diff-ang)
+    (progn
+      (setq p0 (polar x2y2 0 (* dim-space 1.5)))
+      (dq:dim-chain "VER" right-pts p0)
+    )
+  )
+  (if (and (> (length bottom-pts) 2) diff-ang)
+    (progn
+      (setq p0 (polar y1x2 (* pi 1.5) (* dim-space 1.5)))
+      (dq:dim-chain "HOR" bottom-pts p0)
+    )
+  )
+)
+
+;;------------------------------
+;;  명령 함수
+;;------------------------------
+
+(defun c:DQ (/ *error* cmdecho-orig osmode-orig clayer-orig undo-open pick ent-type)
+  (defun *error* (msg)
+    (if undo-open
+      (command "UNDO" "END")
+    )
+    (dq:restore cmdecho-orig osmode-orig clayer-orig)
+    (if (not (wcmatch (strcase msg t) "*cancel*,*exit*,*취소*,*종료*"))
+      (princ (strcat "\n[DimQuick] 오류: " msg))
+    )
+    (princ)
+  )
+  (setq cmdecho-orig (getvar "CMDECHO"))
+  (setq osmode-orig (getvar "OSMODE"))
+  (setq clayer-orig (getvar "CLAYER"))
+  (setq pick (entsel "\n[DimQuick] 치수를 넣을 폴리선/선 선택: "))
+  (if pick
+    (setq ent-type (cdr (assoc 0 (entget (car pick)))))
+  )
+  (cond
+    ((not pick)
+      (princ "\n[DimQuick] 선택된 객체가 없습니다.")
+    )
+    ((not (member ent-type '("LWPOLYLINE" "LINE")))
+      (princ "\n[DimQuick] 폴리선 또는 선만 선택할 수 있습니다.")
+    )
+    (t
+      (setvar "CMDECHO" 0)
+      (setvar "OSMODE" 0)  ; 정의점이 스냅에 끌려가지 않게 끔
+      (command "UNDO" "BEGIN")
+      (setq undo-open T)
+      (setvar "CLAYER" (dq:get-dim-layer))
+      (dq:dimension (car pick))
+      (command "UNDO" "END")
+      (setq undo-open nil)
+    )
+  )
+  (dq:restore cmdecho-orig osmode-orig clayer-orig)
+  (princ)
+)
+
+(princ)

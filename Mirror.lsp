@@ -1,0 +1,60 @@
+;;--------------------------------------------------
+(defun c:4()
+  (command "MIRROR")
+  (princ )
+)
+;;--------------------------------------------------
+;;Mirror lisp: axis at "Mid between 2 Points" lisp
+(defun c:44 (/ ss p1 p2 mid p3)
+ (and
+   (setq ss (progn (princ "\n【Mirror】 ") (ssget)))
+   (setq p1 (getpoint "\n【Mirror】 First point: "))
+   (setq p2 (getpoint p1 "\n【Mirror】 Second point: "))
+   (setq mid (mapcar '(lambda (x1 x2) (/ (+ x1 x2) 2.)) p1 p2))
+   (setq p3 (polar mid (+ (angle p1 p2) (/ pi 2.)) 1.))
+   (command "_.mirror" ss "" "_non" mid "_non" p3 "_no")
+ )
+ (princ)
+)
+;;--------------------------------------------------
+(defun c:444()
+  (command "mirror3d")
+  (princ )
+)
+;;--------------------------------------------------
+;; 4X / 4Y 공용: 기준점을 지나는 수평(4X) / 수직(4Y) 축으로 반전, 원본 삭제, 텍스트는 안 뒤집음
+(defun mx:flip (dx dy / ss p1 p2 mirrtext-orig cmdecho-orig *error*)
+  (defun *error* (msg)
+    (if mirrtext-orig (setvar "MIRRTEXT" mirrtext-orig))
+    (if cmdecho-orig (setvar "CMDECHO" cmdecho-orig))
+    (if (not (wcmatch (strcase msg t) "*cancel*,*exit*,*취소*,*종료*"))
+      (princ (strcat "\n【Mirror】 오류: " msg))
+    )
+    (princ)
+  )
+  (princ "\n【Mirror】 ")
+  (if (setq ss (ssget))
+    (if (setq p1 (getpoint "\n【Mirror】 기준점 지정: "))
+      (progn
+        (setq p2 (list (+ (car p1) dx) (+ (cadr p1) dy) (caddr p1)))
+        (setq mirrtext-orig (getvar "MIRRTEXT"))
+        (setq cmdecho-orig (getvar "CMDECHO"))
+        (setvar "MIRRTEXT" 0)
+        (setvar "CMDECHO" 0)
+        (command "_.MIRROR" ss "" "_non" p1 "_non" p2 "_Y")
+        (*error* "exit")
+      )
+    )
+  )
+  (princ)
+)
+;;--------------------------------------------------
+(defun c:4X ()
+  (mx:flip 1.0 0.0)
+)
+;;--------------------------------------------------
+(defun c:4Y ()
+  (mx:flip 0.0 1.0)
+)
+;;--------------------------------------------------
+(princ )
