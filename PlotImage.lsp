@@ -110,7 +110,7 @@
       ;; 클린스크린이 꺼버린 리본 복구 (원래 켜져 있었을 때만). command 로 바로 실행하면
       ;; 클린스크린 해제와 겹쳐 무시되므로, LISP 가 끝난 뒤 실행되게 SendCommand 사용
       (if (not (equal ribbon-orig 0))
-        (vl-catch-all-apply 'vla-sendcommand (list (pimg:doc) "_.RIBBON "))
+        (vl-catch-all-apply 'vla-sendcommand (list (pimg:doc) "(command \"_.RIBBON\") "))
       )
       (pimg:safe-command "COMMANDLINE")
     )
@@ -441,7 +441,14 @@
      (vl-catch-all-apply 'vla-put-windowstate (list (vlax-get-acad-object) 3))  ; acMax
      ;; COMMANDLINEHIDE 는 SendCommand 로 보내면 확인창이 뜨므로 LISP 에서 직접 실행
      (pimg:safe-command "COMMANDLINEHIDE")
-     (vla-sendcommand doc "CLEANSCREENON\n(pimg:run-job)\n")
+     ;; CLEANSCREENON 이 리본을 직접 닫으면 RIBBONCLOSE 가 마지막 명령으로 남으므로 미리 닫음
+     (vla-sendcommand
+       doc
+       (strcat
+         (if (equal ribbon-orig 0) "" "(command \"_.RIBBONCLOSE\")\n")
+         "(command \"_.CLEANSCREENON\")\n(pimg:run-job)\n"
+       )
+     )
     )
   )
   (princ)
